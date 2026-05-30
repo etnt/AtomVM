@@ -618,6 +618,7 @@ wifi_scan(Options) ->
     Platform =
         case atomvm:platform() of
             esp32 -> ok;
+            pico -> ok;
             Platform0 -> Platform0
         end,
     Passive = proplists:get_bool(passive, Options),

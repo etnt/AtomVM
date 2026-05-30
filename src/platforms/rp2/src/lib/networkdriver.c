@@ -37,6 +37,7 @@
 #endif
 #include <lwip/apps/sntp.h>
 #include <pico/cyw43_arch.h>
+#include <pico/time.h>
 #include <string.h>
 
 #pragma GCC diagnostic pop
@@ -64,14 +65,15 @@ static const char *const sta_got_ip_atom = ATOM_STR("\xA", "sta_got_ip");
 enum network_cmd
 {
     NetworkInvalidCmd = 0,
-    // TODO add support for scan, ifconfig
     NetworkStartCmd,
-    NetworkRssiCmd
+    NetworkRssiCmd,
+    NetworkScanCmd
 };
 
 static const AtomStringIntPair cmd_table[] = {
     { ATOM_STR("\x5", "start"), NetworkStartCmd },
     { ATOM_STR("\x4", "rssi"), NetworkRssiCmd },
+    { ATOM_STR("\x4", "scan"), NetworkScanCmd },
     SELECT_INT_DEFAULT(NetworkInvalidCmd)
 };
 
@@ -96,6 +98,7 @@ enum NetworkDriverEventType
     NetworkDriverEventTypeSTADisconnected,
     NetworkDriverEventTypeSTAConnected,
     NetworkDriverEventTypeGotIP,
+    NetworkDriverEventTypeScanDone,
 };
 
 struct NetworkDriverEvent
@@ -107,6 +110,31 @@ struct NetworkDriverEvent
         struct netif *netif;
     };
 };
+
+// WiFi scan support
+#define MAX_SCAN_RESULTS 20
+
+struct ScanResult
+{
+    uint8_t bssid[6];
+    uint8_t ssid[33];
+    uint8_t ssid_len;
+    int16_t rssi;
+    uint16_t channel;
+    uint8_t auth_mode;
+};
+
+static struct {
+    struct ScanResult results[MAX_SCAN_RESULTS];
+    int count;
+    bool active;
+    uint32_t scan_pid;
+    uint64_t scan_ref_ticks;
+    struct repeating_timer poll_timer;
+} scan_data;
+
+static bool scan_poll_timer_cb(struct repeating_timer *t);
+
 
 enum DriverErrorCodeType
 {
@@ -124,6 +152,7 @@ static void network_driver_netif_status_cb(struct netif *netif);
 static void network_driver_cyw43_assoc_cb(bool assoc);
 
 static void network_driver_do_cyw43_assoc(GlobalContext *glb);
+static void send_scan_results(GlobalContext *glb);
 
 static term tuple_from_addr(Heap *heap, uint32_t addr)
 {
@@ -608,6 +637,10 @@ static EventListener *network_events_handler(GlobalContext *glb, EventListener *
             case NetworkDriverEventTypeGotIP:
                 send_got_ip(event.netif, glb);
                 break;
+            case NetworkDriverEventTypeScanDone:
+                send_scan_results(glb);
+                scan_data.active = false;
+                break;
         }
     }
     return listener;
@@ -722,6 +755,128 @@ static void get_sta_rssi(Context *ctx, term pid, term ref)
     port_send_reply(ctx, pid, ref, reply);
 }
 
+///
+/// WiFi Scan
+///
+
+static int scan_result_cb(void *env, const cyw43_ev_scan_result_t *result)
+{
+    UNUSED(env);
+    if (result && scan_data.count < MAX_SCAN_RESULTS) {
+        struct ScanResult *entry = &scan_data.results[scan_data.count];
+        memcpy(entry->bssid, result->bssid, 6);
+        entry->ssid_len = result->ssid_len > 32 ? 32 : result->ssid_len;
+        memcpy(entry->ssid, result->ssid, entry->ssid_len);
+        entry->ssid[entry->ssid_len] = 0;
+        entry->rssi = result->rssi;
+        entry->channel = result->channel;
+        entry->auth_mode = result->auth_mode;
+        scan_data.count++;
+    }
+    return 0;
+}
+
+static bool scan_poll_timer_cb(struct repeating_timer *t)
+{
+    UNUSED(t);
+    if (scan_data.active && !cyw43_wifi_scan_active(&cyw43_state)) {
+        struct NetworkDriverEvent event;
+        event.type = NetworkDriverEventTypeScanDone;
+        sys_try_post_listener_event_from_isr(driver_data->global, &driver_data->queue, &event);
+        return false; // stop the timer
+    }
+    return true; // keep polling
+}
+
+static void send_scan_results(GlobalContext *glb)
+{
+    // Each AP: map with 5 keys (ssid, bssid, channel, rssi, authmode)
+    // ssid binary: max 32 bytes, bssid: 6 bytes
+    size_t per_ap_size = TERM_MAP_SIZE(5) + TERM_BINARY_HEAP_SIZE(32) + TERM_BINARY_HEAP_SIZE(6);
+    size_t heap_size = PORT_REPLY_SIZE + TUPLE_SIZE(2) + TUPLE_SIZE(2)
+                       + LIST_SIZE(scan_data.count, per_ap_size);
+
+    BEGIN_WITH_STACK_HEAP(heap_size, heap);
+    {
+        term ssid_atom_term = globalcontext_make_atom(glb, ssid_atom);
+        term bssid_atom_term = globalcontext_make_atom(glb, ATOM_STR("\x5", "bssid"));
+        term channel_atom_term = globalcontext_make_atom(glb, ATOM_STR("\x7", "channel"));
+        term rssi_atom_term = globalcontext_make_atom(glb, ATOM_STR("\x4", "rssi"));
+        term authmode_atom_term = globalcontext_make_atom(glb, ATOM_STR("\x8", "authmode"));
+
+        term networks_list = term_nil();
+        for (int i = scan_data.count - 1; i >= 0; i--) {
+            struct ScanResult *entry = &scan_data.results[i];
+
+            term ssid_term = term_from_literal_binary(entry->ssid, entry->ssid_len, &heap, glb);
+            term bssid_term = term_from_literal_binary(entry->bssid, 6, &heap, glb);
+            term channel_term = term_from_int11(entry->channel);
+            term rssi_term = term_from_int11(entry->rssi);
+
+            term authmode;
+            switch (entry->auth_mode) {
+                case 0: // CYW43_AUTH_OPEN
+                    authmode = globalcontext_make_atom(glb, ATOM_STR("\x4", "open"));
+                    break;
+                case 5: // CYW43_AUTH_WPA2_MIXED_PSK
+                    authmode = globalcontext_make_atom(glb, ATOM_STR("\x8", "wpa2_psk"));
+                    break;
+                case 2: // CYW43_AUTH_WPA_TKIP_PSK
+                    authmode = globalcontext_make_atom(glb, ATOM_STR("\x7", "wpa_psk"));
+                    break;
+                default:
+                    authmode = globalcontext_make_atom(glb, ATOM_STR("\xC", "wpa_wpa2_psk"));
+                    break;
+            }
+
+            term ap_map = term_alloc_map(5, &heap);
+            term_set_map_assoc(ap_map, 0, authmode_atom_term, authmode);
+            term_set_map_assoc(ap_map, 1, bssid_atom_term, bssid_term);
+            term_set_map_assoc(ap_map, 2, channel_atom_term, channel_term);
+            term_set_map_assoc(ap_map, 3, rssi_atom_term, rssi_term);
+            term_set_map_assoc(ap_map, 4, ssid_atom_term, ssid_term);
+
+            networks_list = term_list_prepend(ap_map, networks_list, &heap);
+        }
+
+        term scan_tuple = port_heap_create_tuple2(&heap, term_from_int(scan_data.count), networks_list);
+        term scan_results_atom = globalcontext_make_atom(glb, ATOM_STR("\xC", "scan_results"));
+        term results = port_heap_create_tuple2(&heap, scan_results_atom, scan_tuple);
+
+        term ref = term_from_ref_ticks(scan_data.scan_ref_ticks, &heap);
+        term msg = port_heap_create_tuple2(&heap, ref, results);
+
+        port_send_message(glb, term_from_local_process_id(scan_data.scan_pid), msg);
+    }
+    END_WITH_STACK_HEAP(heap, glb);
+}
+
+static void start_wifi_scan(Context *ctx, term pid, term ref, term config)
+{
+    UNUSED(config);
+
+    scan_data.count = 0;
+    scan_data.active = true;
+    scan_data.scan_pid = term_to_local_process_id(pid);
+    scan_data.scan_ref_ticks = term_to_ref_ticks(ref);
+
+    cyw43_wifi_scan_options_t scan_opts = {0};
+    int err = cyw43_wifi_scan(&cyw43_state, &scan_opts, NULL, scan_result_cb);
+    if (err != 0) {
+        scan_data.active = false;
+        size_t error_size = PORT_REPLY_SIZE + TUPLE_SIZE(2) + TUPLE_SIZE(2);
+        port_ensure_available(ctx, error_size);
+        term scan_results_atom = globalcontext_make_atom(ctx->global, ATOM_STR("\xC", "scan_results"));
+        term error = port_create_error_tuple(ctx, globalcontext_make_atom(ctx->global, ATOM_STR("\xB", "scan_failed")));
+        term reply = port_create_tuple2(ctx, scan_results_atom, error);
+        port_send_reply(ctx, pid, ref, reply);
+    } else {
+        // Start polling timer to detect scan completion (every 100ms)
+        add_repeating_timer_ms(100, scan_poll_timer_cb, NULL, &scan_data.poll_timer);
+    }
+    // Results will be sent asynchronously via the event loop when scan completes
+}
+
 static NativeHandlerResult consume_mailbox(Context *ctx)
 {
     Message *message = mailbox_first(&ctx->mailbox);
@@ -753,6 +908,10 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
             }
             case NetworkRssiCmd: {
                 get_sta_rssi(ctx, pid, ref);
+                break;
+            }
+            case NetworkScanCmd: {
+                start_wifi_scan(ctx, pid, ref, config);
                 break;
             }
 
