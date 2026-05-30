@@ -33,22 +33,14 @@
 #define MBEDTLS_CIPHER_PADDING_PKCS7
 
 // Options that enable ciphersuites
-#define MBEDTLS_ECP_DP_SECP192R1_ENABLED
-#define MBEDTLS_ECP_DP_SECP224R1_ENABLED
+// Only modern curves - matches typical browser fingerprint
 #define MBEDTLS_ECP_DP_SECP256R1_ENABLED
 #define MBEDTLS_ECP_DP_SECP384R1_ENABLED
 #define MBEDTLS_ECP_DP_SECP521R1_ENABLED
-#define MBEDTLS_ECP_DP_SECP192K1_ENABLED
-#define MBEDTLS_ECP_DP_SECP224K1_ENABLED
-#define MBEDTLS_ECP_DP_SECP256K1_ENABLED
-#define MBEDTLS_ECP_DP_BP256R1_ENABLED
-#define MBEDTLS_ECP_DP_BP384R1_ENABLED
-#define MBEDTLS_ECP_DP_BP512R1_ENABLED
 #define MBEDTLS_ECP_DP_CURVE25519_ENABLED
-// Following is unused until pico's mbedtls is upgraded
-#define MBEDTLS_ECP_DP_CURVE448_ENABLED
 
 #define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
 #define MBEDTLS_AES_C
 
@@ -85,8 +77,14 @@
 // Pico port
 #define MBEDTLS_PLATFORM_C
 #define MBEDTLS_NO_PLATFORM_ENTROPY
-#define MBEDTLS_HAVE_TIME
+// MBEDTLS_HAVE_TIME removed: ensures ClientHello.random is fully random
+// (not gmt_unix_time which can be 0 before SNTP completes)
 #define MBEDTLS_ENTROPY_HARDWARE_ALT
+
+// TLS extensions (match ESP32 / modern clients)
+#define MBEDTLS_SSL_EXTENDED_MASTER_SECRET
+#define MBEDTLS_SSL_SESSION_TICKETS
+#define MBEDTLS_SSL_RENEGOTIATION
 
 // Options that reduce ROM or RAM usage at the expense of performance
 // These default values match esp-idf's default configuration
